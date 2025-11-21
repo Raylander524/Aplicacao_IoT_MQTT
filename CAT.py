@@ -1,5 +1,4 @@
 import paho.mqtt.client as mqtt
-import json
 import time
 
 # --- Configurações MQTT ---
@@ -14,8 +13,10 @@ TEMP_MIN = 10.0
 HUM_MAX = 80.0        # %
 SOUND_THRESHOLD = 700  # valor analógico do KY-037
 ACCUMULATE_COUNT = 2  # número de leituras a acumular antes de calcular média
-ALERT_COOLDOWN_SECS = 120  # tempo mínimo entre alertas (segundos)
+ALERT_COOLDOWN_SECS = 0  # tempo mínimo entre alertas (segundos)
 TEMP_SPIKE_DELTA = 5.0  # diferença entre duas médias para considerar aumento súbito
+HUM_SPIKE_DELTA = 5.0   # variação (p.p.) entre médias para considerar spike em umidade
+SOUND_SPIKE_DELTA = 50.0  # variação entre médias para considerar spike em som
 
 # buffer para leituras de som que excederam o threshold
 pending_sound_readings = []
@@ -28,6 +29,8 @@ pending_hum_readings = []
 
 # para detectar picos rápidos: guarda a última média calculada
 last_temp_avg = None
+last_hum_avg = None
+last_sound_avg = None
 
 last_alert_time_temp_high = 0
 last_alert_time_temp_low = 0
@@ -52,7 +55,7 @@ def on_message(client, userdata, msg):
     global pending_sound_readings, last_alert_time
     global pending_temp_readings, pending_hum_readings
     global last_alert_time_temp_high, last_alert_time_temp_low, last_alert_time_hum
-    global last_temp_avg
+    global last_temp_avg, last_hum_avg, last_sound_avg
 
     # --- Lógica de alarme ---
     if "temperatura" in topic:
@@ -110,9 +113,25 @@ def on_message(client, userdata, msg):
                 avg = sum(pending_hum_readings) / len(pending_hum_readings)
                 print(f"📊 Média HUM das últimas {len(pending_hum_readings)}: {avg:.1f}%")
                 now = time.time()
-                if avg > HUM_MAX and (now - last_alert_time_hum) >= ALERT_COOLDOWN_SECS:
+                # verifica alta de umidade com cooldown
+                is_high_allowed = (avg > HUM_MAX) and ((now - last_alert_time_hum) >= ALERT_COOLDOWN_SECS)
+                # checa aumento súbito comparando com a última média (sem cooldown específico)
+                is_spike_allowed = False
+                delta_hum = None
+                if last_hum_avg is not None:
+                    delta_hum = avg - last_hum_avg
+                    is_spike_allowed = (delta_hum >= HUM_SPIKE_DELTA)
+
+                if is_spike_allowed and is_high_allowed:
+                    alerta = f"ALERTA: Aumento súbito de umidade (+{delta_hum:.1f} p.p.) e umidade alta (média {avg:.1f}%)"
+                    last_alert_time_hum = now
+                elif is_high_allowed:
                     alerta = f"ALERTA: Umidade excessiva (média {avg:.1f}%)"
                     last_alert_time_hum = now
+                elif is_spike_allowed:
+                    alerta = f"ALERTA: Aumento súbito de umidade (+{delta_hum:.1f} p.p., média atual {avg:.1f}%)"
+
+                last_hum_avg = avg
                 pending_hum_readings = []
         except ValueError:
             pass
@@ -129,9 +148,27 @@ def on_message(client, userdata, msg):
                 avg = sum(pending_sound_readings) / len(pending_sound_readings)
                 print(f"📊 Média das últimas {len(pending_sound_readings)} leituras: {avg:.1f}")
                 now = time.time()
-                if avg < SOUND_THRESHOLD and (now - last_alert_time) >= ALERT_COOLDOWN_SECS:
+                # condição de ruído (mantém cooldown existente)
+                is_sound_threshold = (avg < SOUND_THRESHOLD) and ((now - last_alert_time) >= ALERT_COOLDOWN_SECS)
+                # checa aumento súbito em som comparando com a última média
+                is_sound_spike = False
+                delta_sound = None
+                if last_sound_avg is not None:
+                    delta_sound = avg - last_sound_avg
+                    # para o sensor de som que retorna valores menores quando o ruído é maior,
+                    # um 'spike' de ruído é representado por uma queda no valor.
+                    is_sound_spike = (delta_sound <= -SOUND_SPIKE_DELTA)
+
+                if is_sound_spike and is_sound_threshold:
+                    alerta = f"ALERTA: Aumento súbito de som (variação {abs(delta_sound):.1f}) e ruído elevado (média {avg:.1f})"
+                    last_alert_time = now
+                elif is_sound_threshold:
                     alerta = f"ALERTA: Ruído elevado (média {avg:.1f})"
                     last_alert_time = now
+                elif is_sound_spike:
+                    alerta = f"ALERTA: Aumento súbito de som (variação {abs(delta_sound):.1f}, média atual {avg:.1f})"
+
+                last_sound_avg = avg
                 pending_sound_readings = []
         except ValueError:
             pass
