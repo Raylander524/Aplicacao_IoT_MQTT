@@ -3,7 +3,7 @@ import json
 import time
 
 # --- Configurações MQTT ---
-BROKER = "192.168.0.127"      # ou IP do seu servidor local
+BROKER = "192.168.1.35"      # ou IP do seu servidor local
 PORT = 1883
 TOPIC_SENSOR = "esp32/sensor/#"    # recebe todos os sensores
 TOPIC_ALERT = "esp32/alertas"      # publica os alarmes
@@ -15,6 +15,7 @@ HUM_MAX = 80.0        # %
 SOUND_THRESHOLD = 700  # valor analógico do KY-037
 ACCUMULATE_COUNT = 2  # número de leituras a acumular antes de calcular média
 ALERT_COOLDOWN_SECS = 120  # tempo mínimo entre alertas (segundos)
+TEMP_SPIKE_DELTA = 5.0  # diferença entre duas médias para considerar aumento súbito
 
 # buffer para leituras de som que excederam o threshold
 pending_sound_readings = []
@@ -24,6 +25,9 @@ last_alert_time = 0
 # agora usamos buffers que acumulam todas as leituras (não só as acima do threshold)
 pending_temp_readings = []
 pending_hum_readings = []
+
+# para detectar picos rápidos: guarda a última média calculada
+last_temp_avg = None
 
 last_alert_time_temp_high = 0
 last_alert_time_temp_low = 0
@@ -48,6 +52,7 @@ def on_message(client, userdata, msg):
     global pending_sound_readings, last_alert_time
     global pending_temp_readings, pending_hum_readings
     global last_alert_time_temp_high, last_alert_time_temp_low, last_alert_time_hum
+    global last_temp_avg
 
     # --- Lógica de alarme ---
     if "temperatura" in topic:
@@ -62,14 +67,33 @@ def on_message(client, userdata, msg):
                 avg = sum(pending_temp_readings) / len(pending_temp_readings)
                 print(f"📊 Média TEMP das últimas {len(pending_temp_readings)}: {avg:.2f} °C")
                 now = time.time()
-                # checa alta e baixa com cooldowns separados
-                if avg > TEMP_MAX and (now - last_alert_time_temp_high) >= ALERT_COOLDOWN_SECS:
+                # determina permissões de alerta considerando cooldowns
+                is_high_allowed = (avg > TEMP_MAX) and ((now - last_alert_time_temp_high) >= ALERT_COOLDOWN_SECS)
+                is_low_allowed = (avg < TEMP_MIN) and ((now - last_alert_time_temp_low) >= ALERT_COOLDOWN_SECS)
+                is_spike_allowed = False
+                delta = None
+                if last_temp_avg is not None:
+                    delta = avg - last_temp_avg
+                    is_spike_allowed = (delta >= TEMP_SPIKE_DELTA)
+
+                # Combina alertas quando aplicável: spike + alta / spike + baixa
+                if is_spike_allowed and is_high_allowed:
+                    alerta = f"ALERTA: Aumento súbito de temperatura (+{delta:.1f} °C) e temperatura alta (média {avg:.1f} °C)"
+                    last_alert_time_temp_high = now
+                elif is_spike_allowed and is_low_allowed:
+                    alerta = f"ALERTA: Aumento súbito de temperatura (+{delta:.1f} °C) e temperatura muito baixa (média {avg:.1f} °C)"
+                    last_alert_time_temp_low = now
+                elif is_high_allowed:
                     alerta = f"ALERTA: Temperatura alta (média {avg:.1f} °C)"
                     last_alert_time_temp_high = now
-                elif avg < TEMP_MIN and (now - last_alert_time_temp_low) >= ALERT_COOLDOWN_SECS:
+                elif is_low_allowed:
                     alerta = f"ALERTA: Temperatura muito baixa (média {avg:.1f} °C)"
                     last_alert_time_temp_low = now
-                # limpa o buffer após avaliação
+                elif is_spike_allowed:
+                    alerta = f"ALERTA: Aumento súbito de temperatura (+{delta:.1f} °C, média atual {avg:.1f} °C)"
+
+                # atualiza a última média de temperatura e limpa buffer
+                last_temp_avg = avg
                 pending_temp_readings = []
         except ValueError:
             pass
